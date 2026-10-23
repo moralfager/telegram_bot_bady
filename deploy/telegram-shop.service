@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram Supplement Shop Bots (Buyer & Admin)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# Adjust WorkingDirectory to the location where you cloned the repo
+WorkingDirectory=/opt/telegram-shop
+Environment=PYTHONUNBUFFERED=1
+# Run via python3 directly (no external dependencies needed)
+ExecStart=/usr/bin/python3 -X utf8 -u run.py bots
+Restart=always
+RestartSec=10
+KillMode=process
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

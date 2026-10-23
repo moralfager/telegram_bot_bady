@@ -1,0 +1,10 @@
+[project]
+name = "telegram-supplement-shop"
+version = "0.1.0"
+description = "Local Telegram shop for supplements with buyer/admin bots and Telegram Stars integration."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+

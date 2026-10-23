@@ -1,0 +1,9 @@
+services:
+  shop-bots:
+    build: .
+    container_name: telegram_supplement_shop
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

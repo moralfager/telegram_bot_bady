@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+
+data/*.sqlite3
+data/*.sqlite3-*
+data/*.lock
+data/*.log
+data/media/*.tmp
+data/media/*.bin
+data/media/*.mp4
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
