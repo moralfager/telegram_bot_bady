@@ -26,6 +26,7 @@ class AdminTest(unittest.TestCase):
         self.db = Database(Path(self.tmp.name) / "test.sqlite3")
         self.db.init()
         self.client = Mock()
+        self.client.send_message.return_value = {"message_id": 701}
         self.customer = Mock()
         self.bot = AdminBot(
             client=self.client,
@@ -224,8 +225,7 @@ class AdminTest(unittest.TestCase):
         self.db.update_order_status(order_id, "canceled")
         self.callback(f"a:confirm_paid:{order_id}")
         order = self.db.get_order(order_id)
-        self.assertFalse(order["is_paid"])
-        self.assertEqual(order["status"], "canceled")
+        self.assertIsNone(order)
         self.customer.send_message.assert_not_called()
 
     def test_stars_and_unpaid_status_bypass_rejected(self) -> None:
@@ -358,11 +358,12 @@ class AdminTest(unittest.TestCase):
         order_id = self.order(user_id=43)
         self.callback(f"a:markpaid:{order_id}")
         self.callback(f"a:confirm_paid:{order_id}")
-        for status in ("processing", "delivery", "done"):
+        for status in ("processing", "delivery"):
             self.callback(f"a:status:{order_id}:{status}")
             self.assertEqual(self.db.get_order(order_id)["status"], status)
-        self.callback(f"a:status:{order_id}:canceled")
-        self.assertEqual(self.db.get_order(order_id)["status"], "done")
+        self.callback(f"a:done:{order_id}")
+        self.callback(f"a:done_confirm:{order_id}")
+        self.assertIsNone(self.db.get_order(order_id))
         self.customer.send_message.assert_not_called()
 
     def test_details_delivery_failure_keeps_unsent_flag(self) -> None:
@@ -521,6 +522,45 @@ class AdminTest(unittest.TestCase):
         self.callback(f"a:markpaid:{order_id}")
         self.callback(f"a:confirm_paid:{order_id}")
         self.assertTrue(self.db.get_order(order_id)["is_paid"])
+
+    def test_delivered_order_notification_scheduled_for_deletion(self) -> None:
+        order_id = self.order()
+        self.callback(f"a:markpaid:{order_id}")
+        self.callback(f"a:confirm_paid:{order_id}")
+        self.callback(f"a:done:{order_id}")
+        self.callback(f"a:done_confirm:{order_id}")
+
+        # Check that message was sent and scheduled for deletion
+        pending_future = self.db.pending_message_deletions(now="2099-01-01 00:00:00")
+        self.assertEqual(len(pending_future), 1)
+        self.assertEqual(pending_future[0]["message_id"], 701)
+
+        # Trigger maintenance with future date simulated
+        with self.db.connect() as conn:
+            conn.execute("UPDATE scheduled_deletions SET delete_at = '2000-01-01 00:00:00'")
+        self.bot.maintenance()
+        self.client.delete_message.assert_called_with(7, 701)
+        self.assertEqual(len(self.db.pending_message_deletions()), 0)
+
+    def test_admin_persistent_menu_and_quick_access(self) -> None:
+        from supplement_shop.keyboards import admin_persistent_menu
+        menu = admin_persistent_menu()
+        texts = [b["text"] for row in menu["keyboard"] for b in row]
+        self.assertIn("🎛 Меню админки", texts)
+        self.assertIn("📦 Заказы", texts)
+
+        # Test /start sends persistent menu
+        self.message("/start")
+        calls = [c for c in self.client.send_message.call_args_list if c.kwargs.get("reply_markup") == menu]
+        self.assertTrue(calls)
+
+        # Test clicking "🎛 Меню админки" opens menu
+        self.message("🎛 Меню админки")
+        self.assertIn("Управление магазином", self.last_text())
+
+        # Test clicking "📦 Заказы" opens orders
+        self.message("📦 Заказы")
+        self.assertIn("Заказы", self.last_text())
 
 
 class SettingsValidationTest(unittest.TestCase):

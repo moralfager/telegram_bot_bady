@@ -193,10 +193,25 @@ class Database:
                     user_id INTEGER NOT NULL, body TEXT NOT NULL DEFAULT '{}',
                     delivered TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS revenue_totals (
+                    payment_method TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    orders_count INTEGER NOT NULL DEFAULT 0,
+                    amount_minor INTEGER NOT NULL DEFAULT 0,
+                    rub_minor INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (payment_method, currency)
+                );
+                CREATE TABLE IF NOT EXISTS scheduled_deletions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    delete_at TEXT NOT NULL
+                );
 
                 CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id, is_active);
                 CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_scheduled_deletions_time ON scheduled_deletions(delete_at);
                 """
             )
             self._migrate(conn)
@@ -856,6 +871,40 @@ class Database:
         with self.connect() as conn:
             return int(conn.execute('SELECT COUNT(*) FROM orders' + where, params).fetchone()[0])
 
+    def complete_and_delete_order(self, order_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            order = conn.execute('SELECT * FROM orders WHERE id = ?', (order_id,)).fetchone()
+            if not order:
+                raise ValueError("Заказ не найден.")
+            if not order["is_paid"]:
+                raise ValueError("Сначала подтвердите оплату заказа.")
+
+            # Record aggregated revenue if not demo
+            if not order["is_demo"]:
+                method = order["payment_method"]
+                currency = order["payable_currency"] or ("XTR" if method == "stars" else "RUB")
+                amount = order["total_stars"] if method == "stars" else order["payable_minor"]
+                rub_minor = order["total_rub_minor"]
+
+                conn.execute(
+                    """
+                    INSERT INTO revenue_totals(payment_method, currency, orders_count, amount_minor, rub_minor)
+                    VALUES (?, ?, 1, ?, ?)
+                    ON CONFLICT(payment_method, currency) DO UPDATE SET
+                        orders_count = orders_count + 1,
+                        amount_minor = amount_minor + excluded.amount_minor,
+                        rub_minor = rub_minor + excluded.rub_minor
+                    """,
+                    (method, currency, amount, rub_minor),
+                )
+
+            # Clean up order and related operational records
+            conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+            conn.execute("DELETE FROM payment_guards WHERE payload = ?", (order['payment_payload'],))
+            conn.execute("DELETE FROM expiry_notifications WHERE order_id = ?", (order_id,))
+            conn.execute("DELETE FROM notification_outbox WHERE order_id = ?", (order_id,))
+
     def update_order_status(self, order_id: int, status: str) -> None:
         if status not in ORDER_STATUSES:
             raise ValueError(f"Unknown order status: {status}")
@@ -896,15 +945,11 @@ class Database:
             if user_id is not None and order['receipt_submitted']:
                 return False, 'Чек проверяет менеджер. Для отмены свяжитесь с ним.'
 
-            conn.execute(
-                """
-                UPDATE orders
-                SET status = 'canceled',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (order_id,),
-            )
+            # Cancelled orders are removed to avoid cluttering the database
+            conn.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+            conn.execute("DELETE FROM payment_guards WHERE payload = ?", (order['payment_payload'],))
+            conn.execute("DELETE FROM expiry_notifications WHERE order_id = ?", (order_id,))
+            conn.execute("DELETE FROM notification_outbox WHERE order_id = ?", (order_id,))
             return True, f"Заказ #{order_id} отменён."
 
     def find_latest_cancelable_order(self, user_id: int) -> Row | None:
@@ -1175,6 +1220,27 @@ class Database:
         with self.connect() as conn:
             conn.execute('DELETE FROM expiry_notifications WHERE order_id=?', (order_id,))
 
+    def schedule_message_deletion(self, chat_id: int, message_id: int, delay_seconds: int = 600) -> None:
+        target = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).strftime('%Y-%m-%d %H:%M:%S')
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO scheduled_deletions(chat_id, message_id, delete_at) VALUES (?, ?, ?)",
+                (chat_id, message_id, target),
+            )
+
+    def pending_message_deletions(self, now: str | None = None) -> list[Row]:
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT id, chat_id, message_id FROM scheduled_deletions WHERE delete_at <= ? ORDER BY id LIMIT 100",
+                    (now or utc_now(),),
+                )
+            )
+
+    def acknowledge_message_deletion(self, deletion_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM scheduled_deletions WHERE id = ?", (deletion_id,))
+
     def stats(self) -> dict[str, Any]:
         with self.connect() as conn:
             row = conn.execute(
@@ -1188,16 +1254,38 @@ class Database:
                 FROM orders
                 """
             ).fetchone()
+            rev = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(orders_count), 0) AS total_orders,
+                    COALESCE(SUM(CASE WHEN payment_method = 'stars' THEN amount_minor ELSE 0 END), 0) AS total_stars,
+                    COALESCE(SUM(rub_minor), 0) AS total_rub_minor
+                FROM revenue_totals
+                """
+            ).fetchone()
             products = conn.execute(
                 "SELECT COUNT(*) AS count FROM products WHERE is_active = 1"
             ).fetchone()
+
+            # Merge active paid orders + historical completed totals
+            payments_dict: dict[tuple[str, str], int] = {}
+            for item in conn.execute("SELECT payment_method, currency, amount_minor AS amount FROM revenue_totals"):
+                key = (item["payment_method"], item["currency"])
+                payments_dict[key] = payments_dict.get(key, 0) + int(item["amount"])
+
+            for item in conn.execute("SELECT payment_method, payable_currency AS currency, SUM(payable_minor) AS amount FROM orders WHERE is_demo=0 AND is_paid=1 AND payable_currency != '' GROUP BY payment_method,payable_currency"):
+                key = (item["payment_method"], item["currency"])
+                payments_dict[key] = payments_dict.get(key, 0) + int(item["amount"])
+
+            payments = [{"payment_method": m, "currency": c, "amount": a} for (m, c), a in payments_dict.items()]
+
             return {
-                "orders_total": int(row["orders_total"]),
+                "orders_total": int(row["orders_total"]) + int(rev["total_orders"]),
                 "demo_orders": int(row['demo_orders']),
-                "paid_stars": int(row["paid_stars"]),
-                "paid_orders": int(row["paid_orders"]),
-                "paid_rub_minor": int(row['paid_rub_minor']),
+                "paid_stars": int(row["paid_stars"]) + int(rev["total_stars"]),
+                "paid_orders": int(row["paid_orders"]) + int(rev["total_orders"]),
+                "paid_rub_minor": int(row['paid_rub_minor']) + int(rev["total_rub_minor"]),
                 "payment_issues": int(conn.execute('SELECT COUNT(*) FROM payment_events WHERE resolved=0').fetchone()[0]),
-                "payments": [dict(item) for item in conn.execute("SELECT payment_method, payable_currency AS currency, SUM(payable_minor) AS amount FROM orders WHERE is_demo=0 AND is_paid=1 AND payable_currency != '' GROUP BY payment_method,payable_currency")],
+                "payments": payments,
                 "active_products": int(products["count"]),
             }

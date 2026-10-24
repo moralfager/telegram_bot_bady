@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -17,6 +18,7 @@ from .keyboards import (
     admin_menu_keyboard,
     admin_order_keyboard,
     admin_orders_keyboard,
+    admin_persistent_menu,
     admin_product_card_keyboard,
     admin_products_keyboard,
     button,
@@ -76,14 +78,22 @@ class AdminBot:
             self.client.send_message(chat_id, "Админ-панель доступна только в личном чате с ботом.")
             return
 
-        if text in {"/admin", "/start", "/menu"}:
+        if text in {"/admin", "/start", "/menu", "🎛 Меню админки", "🎛 Меню"}:
             self.sessions.pop(user_id, None)
+            if text in {"/admin", "/start"}:
+                self.client.send_message(chat_id, "Добро пожаловать в админ-панель.", reply_markup=admin_persistent_menu())
             self.show_menu(chat_id)
+            return
+
+        if text in {"/orders", "📦 Заказы", "Заказы"}:
+            self.sessions.pop(user_id, None)
+            self.show_orders(chat_id)
             return
 
         if text == "/cancel":
             self.sessions.pop(user_id, None)
-            self.client.send_message(chat_id, "Действие отменено.", reply_markup=admin_menu_keyboard())
+            self.client.send_message(chat_id, "Действие отменено.", reply_markup=admin_persistent_menu())
+            self.show_menu(chat_id)
             return
 
         if user_id in self.sessions:
@@ -95,7 +105,8 @@ class AdminBot:
                 print(f"[admin] Telegram API error: {exc}")
             return
 
-        self.client.send_message(chat_id, "Выберите действие.", reply_markup=admin_menu_keyboard())
+        self.client.send_message(chat_id, "Выберите действие.", reply_markup=admin_persistent_menu())
+        self.show_menu(chat_id)
 
     def handle_callback(self, callback: dict[str, Any]) -> None:
         callback_id = callback["id"]
@@ -116,7 +127,7 @@ class AdminBot:
             self.client.answer_callback_query(callback_id)
             if data == "noop":
                 return
-            if not data.startswith(("a:confirm_paid:", "a:issue_confirm:", 'a:release_confirm:')):
+            if not data.startswith(("a:confirm_paid:", "a:issue_confirm:", 'a:release_confirm:', 'a:done_confirm:')):
                 self.sessions.pop(user_id, None)
             if data == "a:cancel":
                 self.sessions.pop(user_id, None)
@@ -247,6 +258,38 @@ class AdminBot:
                 self.db.reject_receipt(order_id)
                 order = self.db.get_order(order_id)
                 self.show_order(chat_id, order_id, message)
+            elif data.startswith("a:done:"):
+                order_id = int(data.split(":")[2])
+                order = self.db.get_order(order_id)
+                if not order:
+                    raise ValueError("Заказ не найден.")
+                if not order["is_paid"]:
+                    raise ValueError("Сначала подтвердите оплату заказа.")
+                self.sessions[user_id] = {"action": "complete_order", "order_id": order_id}
+                self.edit_or_send_text(
+                    chat_id,
+                    message,
+                    f"⚠️ <b>Завершить и удалить заказ #{order_id}?</b>\n\n"
+                    "После подтверждения заказ будет помечен как доставленный и удалён из базы для экономии места. "
+                    "Сумма заказа будет сохранена в общей статистике выручки.",
+                    keyboard([
+                        [button("✅ Да, заказ доставлен (удалить)", f"a:done_confirm:{order_id}")],
+                        [button("⬅️ Назад к заказу", f"a:order:{order_id}")],
+                    ]),
+                )
+            elif data.startswith("a:done_confirm:"):
+                order_id = int(data.split(":")[2])
+                session = self.sessions.pop(user_id, {})
+                if session.get("action") != "complete_order" or session.get("order_id") != order_id:
+                    raise ValueError("Сначала откройте заказ и нажмите «Доставлен».")
+                self.db.complete_and_delete_order(order_id)
+                sent = self.client.send_message(
+                    chat_id,
+                    f"✅ Заказ #{order_id} доставлен и удалён из базы. Выручка сохранена в статистике.",
+                )
+                if isinstance(sent, dict) and sent.get("message_id"):
+                    self.schedule_message_deletion(chat_id, int(sent["message_id"]), delay_seconds=600)
+                self.show_orders(chat_id, message)
             elif data.startswith("a:status:"):
                 _, _, order_id, status = data.split(":")
                 self.update_order_status(chat_id, int(order_id), status, message)
@@ -547,7 +590,17 @@ class AdminBot:
         status: str,
         message: dict[str, Any] | None = None,
     ) -> None:
-        if status not in {"processing", "delivery", "done", "canceled"}:
+        if status == "done":
+            self.db.complete_and_delete_order(order_id)
+            sent = self.client.send_message(
+                chat_id,
+                f"✅ Заказ #{order_id} доставлен и удалён из базы. Выручка сохранена в статистике.",
+            )
+            if isinstance(sent, dict) and sent.get("message_id"):
+                self.schedule_message_deletion(chat_id, int(sent["message_id"]), delay_seconds=600)
+            self.show_orders(chat_id, message)
+            return
+        if status not in {"processing", "delivery", "canceled"}:
             raise ValueError("Для подтверждения оплаты используйте кнопку «Оплата получена».")
         before = self.db.get_order(order_id)
         if not before:
@@ -555,7 +608,13 @@ class AdminBot:
         if status != "canceled" and not before["is_paid"]:
             raise ValueError("Сначала подтвердите оплату заказа.")
         self.db.update_order_status(order_id, status)
-        self.show_order(chat_id, order_id, message)
+        if status == "canceled":
+            sent = self.client.send_message(chat_id, f"✖️ Заказ #{order_id} отменён и удалён.")
+            if isinstance(sent, dict) and sent.get("message_id"):
+                self.schedule_message_deletion(chat_id, int(sent["message_id"]), delay_seconds=600)
+            self.show_orders(chat_id, message)
+        else:
+            self.show_order(chat_id, order_id, message)
 
     def show_payment_issues(self, chat_id: int, message: dict[str, Any] | None = None, page: int = 0) -> None:
         with self.db.connect() as conn:
@@ -1051,3 +1110,20 @@ class AdminBot:
                 if "message is not modified" in exc.description.lower():
                     return
         self.client.send_message(chat_id, text, reply_markup=reply_markup)
+
+    def schedule_message_deletion(self, chat_id: int, message_id: int, delay_seconds: int = 600) -> None:
+        self.db.schedule_message_deletion(chat_id, message_id, delay_seconds)
+        timer = threading.Timer(delay_seconds, self.safe_delete, args=[chat_id, message_id])
+        timer.daemon = True
+        timer.start()
+
+    def safe_delete(self, chat_id: int, message_id: int) -> None:
+        try:
+            self.client.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+
+    def maintenance(self) -> None:
+        for item in self.db.pending_message_deletions():
+            self.safe_delete(int(item["chat_id"]), int(item["message_id"]))
+            self.db.acknowledge_message_deletion(int(item["id"]))

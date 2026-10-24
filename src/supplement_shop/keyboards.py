@@ -85,6 +85,15 @@ def invoice_keyboard(order_id: int, amount_stars: int) -> dict[str, Any]:
     )
 
 
+def admin_persistent_menu() -> dict[str, Any]:
+    return {
+        'keyboard': [[{'text': '🎛 Меню админки'}, {'text': '📦 Заказы'}]],
+        'resize_keyboard': True,
+        'is_persistent': True,
+        'one_time_keyboard': False,
+    }
+
+
 def admin_menu_keyboard(pending_count: int = 0) -> dict[str, Any]:
     orders_label = f"🧾 Заказы ({pending_count})" if pending_count > 0 else "🧾 Заказы"
     return keyboard(
@@ -140,7 +149,6 @@ def admin_orders_keyboard(orders, page=0, total=None, status='all', search='') -
     rows.extend([[button('⏳ Ждут реквизитов', 'a:orders:pending_details:0')],
                  [button('Все', 'a:orders:all:0'), button('Неоплаченные', 'a:orders:unpaid:0')],
                  [button('Оплаченные', 'a:orders:paid:0')],
-                 [button('Завершённые', 'a:orders:done:0'), button('Отменённые', 'a:orders:canceled:0')],
                  [button('Поиск заказа', 'a:ordersearch')]])
     rows.append([button("⬅️ Меню", "a:menu")])
     return keyboard(rows)
@@ -160,7 +168,7 @@ def admin_order_keyboard(order, page=0, status='all') -> dict[str, Any]:
             rows.append([button('Отклонить чек', f'a:rejectreceipt:{order_id}')])
     if order['is_paid']:
         rows.extend([
-            [button("Доставлен", f"a:status:{order_id}:done")],
+            [button("Доставлен", f"a:done:{order_id}")],
         ])
     elif order['status'] != 'canceled':
         rows.append([button('Отменить заказ', f'a:status:{order_id}:canceled')])
@@ -186,7 +194,7 @@ def page_rows(page, total, size, prefix):
 
 
 def persistent_menu():
-    rows = [('Товары',), ('Корзина', 'Мои заказы'), ('Техническая поддержка',),
+    rows = [('Товары', 'Корзина'), ('Техническая поддержка',),
             ('Отзывы', 'Как купить?'), ('Страна', 'Условия покупки')]
     return {'keyboard': [[{'text': MENU_LABELS[label]} for label in row] for row in rows],
             'resize_keyboard': True, 'is_persistent': True, 'one_time_keyboard': False}
@@ -199,7 +207,18 @@ def country_keyboard(countries):
 def catalog_keyboard(products, page, total, country=None):
     rows = [[button(f"{product['title'][:42]} · {product_price(product, country)}", f"product:{product['id']}:{page}")] for product in products]
     rows.extend(page_rows(page, total, 12, 'catalog'))
-    rows.append([button('Корзина', 'cart'), button('Мои заказы', 'orders:0')])
+    rows.append([button('Корзина', 'cart')])
+    return keyboard(rows)
+
+
+def customer_order_action_keyboard(order):
+    rows = []
+    if not order['is_paid'] and order['status'] != 'canceled':
+        if order['payment_method'] == 'stars':
+            rows.append([button('⭐ Оплатить Stars', f"invoice:{order['id']}")])
+        if not order['receipt_submitted']:
+            rows.append([button('✖️ Отменить заказ', f"order_cancel:{order['id']}")])
+    rows.append([button('📂 Каталог', 'home')])
     return keyboard(rows)
 
 
@@ -217,5 +236,5 @@ def customer_order_keyboard(order, page=0):
             rows.append([button('Оплатить Stars', f"invoice:{order['id']}")])
         if not order['receipt_submitted']:
             rows.append([button('Отменить заказ', f"order_cancel:{order['id']}")])
-    rows.append([button('Назад к заказам', f'orders:{page}')])
+    rows.append([button('Назад к каталогу', 'home')])
     return keyboard(rows)

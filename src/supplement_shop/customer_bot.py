@@ -20,7 +20,7 @@ from .keyboards import (
 from .pricing import money, quote
 from .telegram_api import BotClient, TelegramApiError
 
-DELIVERY_PROMPT = 'Пришлите точный адрес или ссылку на выбранный ПВЗ Wildberries.'
+DELIVERY_PROMPT = 'Укажите ваш город и точный адрес или ссылку на выбранный ПВЗ Wildberries.'
 PHONE_OR_TAG_RE = re.compile(r'(@[A-Za-z][A-Za-z0-9_]{4,31}|\+?[0-9]{7,15})\Z')
 
 class CustomerBot:
@@ -58,11 +58,18 @@ class CustomerBot:
         command = next((plain for plain, label in MENU_LABELS.items() if command == label), command)
         menu = {
             "/start": "home", "/menu": "home", "Товары": "home",
-            "/cart": "cart", "Корзина": "cart", "/orders": "orders", "Мои заказы": "orders",
+            "/cart": "cart", "Корзина": "cart",
             "/country": "country", "Страна": "country", "Техническая поддержка": "support",
             "/support": "support", "/paysupport": "support", "Отзывы": "reviews",
             "Как купить?": "how", "/terms": "terms", "Условия покупки": "terms",
         }
+        if command in {"/orders", "Мои заказы"}:
+            self.client.send_message(
+                chat_id,
+                "Раздел «Мои заказы» отключен. Информация о заказе отправляется сразу после оформления.",
+                reply_markup=persistent_menu(),
+            )
+            return
         if command == "/cancel":
             self.cancel_checkout_or_order(chat_id, user_id)
             return
@@ -76,8 +83,6 @@ class CustomerBot:
                 self.show_countries(chat_id)
             elif action in {"support", "reviews", "how", "terms"}:
                 self.show_information(chat_id, action)
-            elif action == 'orders':
-                self.show_orders(chat_id, user_id)
             elif not self.ensure_country(chat_id, user_id):
                 return
             elif action == "home":
@@ -212,8 +217,12 @@ class CustomerBot:
                 self.finish_checkout_from_payment_choice(chat_id, user_id, data)
             elif data == "orders" or data.startswith("orders:"):
                 self.checkout_sessions.pop(user_id, None)
-                page = int(data.split(":")[1]) if ":" in data else 0
-                self.show_orders(chat_id, user_id, message=message, page=page)
+                self.edit_or_send_text(
+                    chat_id,
+                    message,
+                    "Раздел «Мои заказы» отключен. Информация о заказе отправлена при его оформлении.",
+                    back_home_keyboard(),
+                )
             elif data.startswith("order:"):
                 _, order_id, page = data.split(":")
                 self.show_order(chat_id, user_id, int(order_id), int(page), message)
@@ -479,7 +488,7 @@ class CustomerBot:
                 self.show_order(chat_id, user_id, order_id)
                 self.send_stars_invoice(chat_id, order)
         except TelegramApiError:
-            self.client.send_message(chat_id, "Заказ сохранён. Откройте «Мои заказы» и повторите получение реквизитов или счёта.", reply_markup=persistent_menu())
+            self.client.send_message(chat_id, "Заказ сохранён. Повторите попытку или обратитесь в поддержку.", reply_markup=persistent_menu())
 
     def send_stars_invoice(self, chat_id, order):
         if (order["is_paid"] or order["status"] == "canceled" or order["payment_method"] != "stars"
@@ -512,7 +521,7 @@ class CustomerBot:
             query.get("invoice_payload", ""), int(query.get("from", {}).get("id", 0)),
             int(query.get("total_amount", 0)), query.get("currency", ""),
         )
-        self.client.answer_pre_checkout_query(query["id"], ok=ok, error_message="" if ok else "Заказ недоступен, уже оплачен или срок оплаты истёк. Откройте «Мои заказы».")
+        self.client.answer_pre_checkout_query(query["id"], ok=ok, error_message="" if ok else "Заказ недоступен, уже оплачен или срок оплаты истёк.")
 
     def handle_successful_payment(self, message):
         payment = message["successful_payment"]

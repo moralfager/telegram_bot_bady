@@ -105,9 +105,26 @@ def command_bots() -> int:
         while not stop_event.is_set():
             try:
                 customer_bot.maintenance()
+                admin_bot.maintenance()
             except Exception as exc:
                 print(f'[maintenance] {exc}')
             stop_event.wait(60)
+
+    try:
+        admin_client.set_my_commands([
+            {"command": "admin", "description": "Панель управления"},
+            {"command": "orders", "description": "Заказы"},
+        ])
+    except Exception as exc:
+        print(f"[admin-commands] {exc}")
+
+    try:
+        buyer_client.set_my_commands([
+            {"command": "start", "description": "Каталог товаров"},
+            {"command": "cart", "description": "Корзина"},
+        ])
+    except Exception as exc:
+        print(f"[buyer-commands] {exc}")
 
     threads = [
         threading.Thread(

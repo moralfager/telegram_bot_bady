@@ -18,7 +18,7 @@ All CLI commands go through `run.py` (which injects `src/` into `sys.path` and c
 - **Run bots**: `python -X utf8 -u run.py bots` (requires `BUYER_BOT_TOKEN`, `ADMIN_BOT_TOKEN`, and `ADMIN_IDS` in `.env`).
 - **Seed catalog from media**: `python run.py seed-products --confirm-reset` (creates a clean DB and imports 4 products from `data/media/` with images).
 - **Migrate DB (with automatic backup)**: `python run.py migrate`
-- **Run unit tests**: `python -m unittest discover -s tests` (110 tests total).
+- **Run unit tests**: `python -m unittest discover -s tests` (119 tests total).
 - **Syntax / bytecode check (lint equivalent)**: `python -m compileall -q src`.
 - **Build**: None needed (pure Python scripts executed directly).
 
@@ -56,10 +56,14 @@ All CLI commands go through `run.py` (which injects `src/` into `sys.path` and c
 - **Real Stars in Demo mode**: Even after `reset-demo` (`manual_payments_demo=1`), if `.env` has `PAYMENT_MODE=stars`, Telegram Stars invoices charge real `XTR`. Only `PAYMENT_MODE=mock` simulates Stars locally.
 - **Successful payment retry behavior**: In `telegram_api.run_polling`, if `handler(update)` raises an exception on a `successful_payment` message, the loop deliberately breaks without advancing `offset` so the payment event is retried.
 
+- **Delivered/canceled orders deletion**: Completed orders marked as delivered («Доставлен») and canceled orders are automatically deleted from `orders` (with cascade deletion of `order_items`, `payment_guards`, notifications). Lifetime revenue statistics are preserved in the `revenue_totals` aggregate table.
+- **Customer order view**: «Мои заказы» button has been retired from persistent menu and catalog. In-flight order actions (Stars payment, cancellation) are attached directly to the order message sent after checkout.
+
 ## 8. Current State
 - **What works**:
   - Full customer and admin bot flows, multi-currency pricing, frozen order payment snapshots (`payment_snapshot`), 3-hour order expiration, in-flight Stars payment protection (`payment_guards` / `payment_check` status), unmatched payment logging (`payment_events`), and retryable notification outboxes.
-  - All 107 unit tests (`unittest`) and `compileall` pass (`data/verification-test-error.log`).
+  - Automatic order pruning upon completion/cancellation with historical revenue preservation in `revenue_totals`.
+  - All 119 unit tests (`unittest`) and `compileall` pass.
   - Local SQLite DB (`data/shop.sqlite3`) and multiple backups exist in `data/`; bots have been tested against live Telegram bot tokens (`data/bots-output.log`).
 - **What is unfinished / manual by design** (per `docs/PROJECT_REVIEW.md`):
   - No automated bank or blockchain API verification (managers verify receipts/tx hashes manually).

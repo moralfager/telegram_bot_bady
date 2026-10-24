@@ -260,7 +260,8 @@ class ShopTest(unittest.TestCase):
         self.bot.start_checkout(42, 42)
         self.message('Покупатель')
         self.message('@buyer_test')
-        prompt = 'Пришлите точный адрес или ссылку на выбранный ПВЗ Wildberries.'
+        from supplement_shop.customer_bot import DELIVERY_PROMPT
+        prompt = DELIVERY_PROMPT
         self.assertEqual(self.client.send_message.call_args.args[1], prompt)
         link = 'https://www.wildberries.ru/services/besplatnaya-dostavka?point=123'
         self.message(link)
@@ -598,6 +599,31 @@ class ShopTest(unittest.TestCase):
             self.assertEqual(part.count('<b>'),part.count('</b>'))
             plain.extend(current)
         self.assertEqual(''.join(plain),'<&'*4000)
+
+    def test_persistent_menu_and_catalog_have_no_my_orders(self):
+        from supplement_shop.keyboards import persistent_menu, catalog_keyboard
+        pm = persistent_menu()
+        pm_buttons = [btn['text'] for row in pm['keyboard'] for btn in row]
+        self.assertFalse(any('Мои заказы' in btn for btn in pm_buttons))
+
+        cat_kb = catalog_keyboard([], 0, 0)
+        cat_buttons = [btn['text'] for row in cat_kb['inline_keyboard'] for btn in row]
+        self.assertFalse(any('Мои заказы' in btn for btn in cat_buttons))
+
+    def test_customer_orders_command_and_callback_inform_disabled(self):
+        self.message('/orders')
+        sent = self.client.send_message.call_args.kwargs.get('text') or self.client.send_message.call_args[0][1]
+        self.assertIn('отключен', sent)
+
+        self.callback('orders:0')
+        edit = self.client.edit_message_text.call_args.kwargs.get('text') or self.client.edit_message_text.call_args[0][1]
+        self.assertIn('отключен', edit)
+
+    def test_customer_cancels_order_deletes_from_database(self):
+        order = self.order()
+        self.assertIsNotNone(self.db.get_order(order['id']))
+        self.callback(f"order_cancel:{order['id']}")
+        self.assertIsNone(self.db.get_order(order['id']))
 
 
 if __name__ == '__main__':

@@ -111,7 +111,7 @@ class DatabaseTest(unittest.TestCase):
         ok, message = self.db.cancel_order(order_id, user_id=user_id)
         self.assertTrue(ok, message)
         canceled = self.db.get_order(order_id)
-        self.assertEqual(canceled["status"], "canceled")
+        self.assertIsNone(canceled)
         after_cancel = self.db.get_product(int(product["id"]))
         self.assertEqual(after_cancel["stock"], stock_before)
 
@@ -159,6 +159,123 @@ class DatabaseTest(unittest.TestCase):
         order = self.db.get_order(order_id)
         self.assertEqual(order["is_paid"], 1)
         self.assertEqual(order["status"], "paid")
+
+    def test_order_delivery_deletes_order_and_accumulates_revenue_stats(self) -> None:
+        product = self.db.list_products(active_only=True)[0]
+        user_id = 55
+        self.db.add_to_cart(user_id, int(product["id"]))
+        order_id = self.db.create_order_from_cart(
+            user_id=user_id,
+            customer_name="Buyer 55",
+            phone="+77001112233",
+            address="Street 1",
+            status="paid",
+            is_paid=True,
+            payment_method="card",
+        )
+        # Update payable info to non-demo
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE orders SET is_demo = 0, is_paid = 1, payable_currency = 'RUB', payable_minor = 50000, total_rub_minor = 50000 WHERE id = ?",
+                (order_id,),
+            )
+        stats_before = self.db.stats()
+        self.assertEqual(stats_before["paid_orders"], 1)
+        self.assertEqual(stats_before["paid_rub_minor"], 50000)
+
+        # Complete and delete order
+        self.db.complete_and_delete_order(order_id)
+
+        # Order must be deleted from DB
+        self.assertIsNone(self.db.get_order(order_id))
+        self.assertEqual(len(self.db.list_order_items(order_id)), 0)
+
+        # Revenue stats must still reflect the deleted order
+        stats_after = self.db.stats()
+        self.assertEqual(stats_after["paid_orders"], 1)
+        self.assertEqual(stats_after["paid_rub_minor"], 50000)
+        self.assertEqual(stats_after["orders_total"], 1)
+
+    def test_complete_unpaid_order_fails(self) -> None:
+        product = self.db.list_products(active_only=True)[0]
+        user_id = 56
+        self.db.add_to_cart(user_id, int(product["id"]))
+        order_id = self.db.create_order_from_cart(
+            user_id=user_id,
+            customer_name="Buyer 56",
+            phone="+77001112234",
+            address="Street 2",
+            status="awaiting_payment",
+            is_paid=False,
+            payment_method="card",
+        )
+        with self.assertRaises(ValueError):
+            self.db.complete_and_delete_order(order_id)
+        # Order still exists
+        self.assertIsNotNone(self.db.get_order(order_id))
+
+    def test_large_dataset_pagination_and_search(self) -> None:
+        # Benchmark and verify pagination & search with 1000 orders
+        import time
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for i in range(1, 1001):
+                conn.execute(
+                    """
+                    INSERT INTO orders(
+                        id, user_id, customer_name, phone, telegram_tag, address, comment,
+                        status, is_paid, is_demo, payment_method, payable_currency, payable_minor,
+                        total_rub_minor, total_stars, payment_payload, created_at, expires_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, 0, 'card', 'RUB', 10000,
+                        10000, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """,
+                    (
+                        10000 + i, 1000 + i, f"Customer {i}", f"+7999{i:07d}", f"tag_{i}",
+                        f"Address {i}", "", "awaiting_payment" if i % 2 == 0 else "paid",
+                        1 if i % 2 != 0 else 0, f"payload_{i}"
+                    )
+                )
+
+        t0 = time.perf_counter()
+        count = self.db.count_orders()
+        self.assertGreaterEqual(count, 1000)
+
+        # Pagination on page 50 (offset 500)
+        page_orders = self.db.list_orders(limit=10, offset=500)
+        self.assertEqual(len(page_orders), 10)
+
+        # Search by tag
+        found_tag = self.db.list_orders(search="tag_999")
+        self.assertEqual(len(found_tag), 1)
+        self.assertEqual(found_tag[0]["telegram_tag"], "tag_999")
+
+        # Search by ID
+        found_id = self.db.list_orders(search="#10500")
+        self.assertEqual(len(found_id), 1)
+        self.assertEqual(found_id[0]["id"], 10500)
+
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 1.0)  # Should execute well under 1 second
+
+    def test_scheduled_message_deletions(self) -> None:
+        self.db.schedule_message_deletion(chat_id=123, message_id=456, delay_seconds=600)
+        # Not yet due now
+        pending = self.db.pending_message_deletions()
+        self.assertEqual(len(pending), 0)
+
+        # Due when checked with future timestamp
+        future = "2099-01-01 00:00:00"
+        pending_future = self.db.pending_message_deletions(now=future)
+        self.assertEqual(len(pending_future), 1)
+        self.assertEqual(pending_future[0]["chat_id"], 123)
+        self.assertEqual(pending_future[0]["message_id"], 456)
+
+        # Acknowledge deletion
+        self.db.acknowledge_message_deletion(int(pending_future[0]["id"]))
+        self.assertEqual(len(self.db.pending_message_deletions(now=future)), 0)
 
 
 if __name__ == "__main__":
